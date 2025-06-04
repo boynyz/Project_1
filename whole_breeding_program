@@ -1,0 +1,321 @@
+#whole_loop_new
+library(AlphaSimR)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+
+#setwd()
+setwd("Path/To/working_directory")
+
+# Clean the working environment and set default settings
+rm(list = ls())
+par(mfrow = c(1, 1), mar = c(1, 1, 1, 1))
+
+# Setup parallel backend to use many processors
+cl <- makeCluster(30, outfile = "cluster_output.txt") # define how many cores should be used
+registerDoParallel(cl) #start parallel processing
+
+# make grid to loop through all combination of heritability (HSQ), number of QTL (nQTL), recombination rate increases (inc) and replications (rep)
+args <- commandArgs(trailingOnly = TRUE)
+i <- as.integer(args[1])
+grid <- expand.grid(HSQ = c(0.2,0.5,0.8), nQTL = c(100,1000,10000), inc = c(2,4,8), rep = 1:100)
+grid$file <- paste0("GenoInc_nQTL",grid$nQTL,"_HSQ",grid$HSQ,"_Inc",grid$inc,"_Rep",grid$rep,".txt")
+grid <- grid[!grid$file %in% list.files(path = "Path/To/working_directory"),]
+
+# define how many individuals should be generated per generation
+n_crosses <- 60
+n_parents <- 30
+n_ind <- 50
+
+# Perform the parallel computation
+results <- foreach(i = 1:nrow(grid), .packages = c("AlphaSimR", "foreach", "doParallel"), .combine = 'list') %dopar% { #start loop
+  print(paste0(round((i/325)*100,3),"%"))
+  
+  #define numbers based on table
+  nQTL <- grid[i,]$nQTL
+  HSQ <- grid[i,]$HSQ
+  inc <- grid[i,]$inc
+  rep <- grid[i,]$rep
+  
+  # load map define genetic and physical map length
+  map_data <- read.table("Path/To/working_directory/Map_SNPs.txt", header = T)
+  map_data <- map_data[order(map_data$CHROM, map_data$POS_cM), ]
+  genetic_maps <- split(map_data$POS_cM, map_data$CHROM)
+  physical_maps <- split(map_data$POS_bp, map_data$CHROM)
+  
+  SNPs_per_Chr <- sapply(genetic_maps, length)
+  length_M <- sapply(genetic_maps, max)/100
+  length_bp <- sapply(physical_maps, max)
+  
+  # Simulate founder genomes
+  founderGenomes <- runMacs2(
+    nInd = n_parents,       # number of founder individuals
+    nChr = 10,              # number of chromosomes
+    bp = length_bp,         # physical size of a chromosome
+    genLen = length_M,      # genetic size of a chromosome
+    mutRate = 3 * 10e-8,    # mutation rate
+    segSites = SNPs_per_Chr,# segregating sites per chromosomes, i.e. loci varying with their alleles within the population         
+    ploidy = 2,             # ploidy level, unless working with an autopolypoid leave at 2, allopolyploids mostly act as diploids
+    inbred = T,
+    Ne = 100                
+  )
+  
+  SP <- SimParam$new(founderGenomes) # get simulation parameters
+  
+  temp <- lapply(1:10, function(x){pullSegSiteHaplo(founderGenomes,chr = x, simParam = SP)})
+  
+  founderpop2 <- newMapPop(genMap = genetic_maps, haplotypes = temp, inbred = F, ploidy = 2) # put in custom maps
+  
+  SP = SimParam$new(founderpop2)
+  
+  SP$nThreads <- 1
+  SP$addTraitA(nQtlPerChr = nQTL / 10) # number of QTL per chromosome
+  SP$setVarE(h2 = HSQ)                 # defines the heritability for the trait
+  
+  # add the different SNP-chips
+  SP$addSnpChip(nSnpPerChr = 100, name = "1k")
+  SP$addSnpChip(nSnpPerChr = 200, name = "2k")
+  SP$addSnpChip(nSnpPerChr = 500, name = "5k")
+  SP$addSnpChip(nSnpPerChr = 1000, name = "10k")
+  
+  
+  # Creation of base population of DHs
+  pop <- newPop(founderpop2, simParam = SP)        # Founding population of DH
+  pop <- randCross(pop, nCrosses = n_crosses, nProgeny = 1, simParam = SP) # crosses
+  pop <- self(pop, nProgeny = n_ind, simParam = SP)   # selfing
+  pop <- makeDH(pop, nDH = 1, simParam = SP)          # creation of DH from the selfings
+  pop <- setPheno(pop, h2 = HSQ, simParam = SP)       # Phenotype base population individuals
+  
+  # Burn in process (10 generations of phenotypic selection)
+  genMean <- meanG(pop)                # mean genetic value of the trait of the base pop
+  genVar <- varG(pop)                  # genetic variance of the trait of the base pop
+  genicVar <- genicVarG(pop, simParam = SP)
+  
+  for (generation in 1:10) {
+    pop <- selectCross(pop, nInd = n_parents, use = "pheno", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop <- self(pop, nProgeny = n_ind, simParam = SP)
+    pop <- makeDH(pop, nDH = 1, simParam = SP)
+    pop <- setPheno(pop, h2 = HSQ, simParam = SP)
+    genMean <- c(genMean, meanG(pop))
+    genVar <- c(genVar, varG(pop))
+    genicVar <- c(genicVar, genicVarG(pop, simParam = SP))
+    
+  }
+  
+  # Save the genetic mean and variance of each generation
+  RES_BURN <- data.frame(generation = 1:11, Geno = genMean, VarGeno = genVar, VarGenic = genicVar, PredAccgeno = "NA", Marker = "Pheno_Burn", INC = "Normal")
+  RES_BURN$rep <- rep   
+  RES_BURN$nQTL <- nQTL
+  RES_BURN$HSQ <- HSQ
+  write.table(RES_BURN, file = paste0("Path/To/Storrage/Burnin_nQTL", nQTL, "_HSQ", HSQ, "_Inc", inc, "_Rep", rep, ".txt"), quote = F, sep = "\t")
+  
+  #copy population for later use
+  
+  popinc <- pop # after burn in used for increased recombination
+  popPhen <- pop # after burn in for phenotypic selection
+  popgeno <- pop # after burn in for GS
+  
+  # 15 cycles of phenotypic selection
+  
+  genMean <- meanG(pop)
+  genVar <- varG(pop)
+  genicVar <- genicVarG(pop, simParam = SP)
+  
+  #simulation of cycles
+  start <- Sys.time()
+  for(generation in 1:15){
+    print(generation)
+    popPhen = selectCross(pop = popPhen, nInd = n_parents, simParam = SP,
+                          use = "pheno", nCrosses = n_crosses, nProgeny = 1)
+    # select 30 out of the 50
+    popPhen <- self(popPhen, simParam = SP) # selfing
+    popPhen <- makeDH(popPhen,nDH = n_ind, simParam = SP) # create double haploids
+    popPhen <- setPheno(popPhen, h2 = HSQ, simParam = SP) # phenotype
+    genMean <- c(genMean, meanG(popPhen))   #  save the new genetic mean of the population after crossing
+    genVar <- c(genVar, varG(popPhen))      # save the new genetic variance of the population after crossing
+    genicVar <- c(genicVar, genicVarG(popPhen, simParam = SP))
+  }
+  end <- Sys.time()
+  print(end-start)
+  
+  # save the genetic mean and variance of each generation
+  RES_PHENO <- data.frame(generation = 1:16, Geno = genMean[1:16], VarGeno = genVar[1:16], VarGenic = genicVar[1:16], PredAccgeno = "NA", Marker = "Pheno", INC = "Normal")
+  RES_PHENO$rep <- rep
+  RES_PHENO$nQTL <- nQTL
+  RES_PHENO$HSQ <- HSQ
+  write.table(RES_PHENO,file = paste0("Path/To/Storrage/Pheno_nQTL",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+  
+  # 15 cycles of genomic selection for the different SNP arrays
+  SNPArr <- c("1k","2k","5k","10k")
+  RES_GENO <- list()
+  #measure the prediction accuracy of genomic selection along the program
+  start <- Sys.time()
+  
+  for (arr in 1:4) {
+    SNPArr[arr]
+    
+    popgenox <- popgeno
+    genMean <- meanG(popgenox) # current genetic mean of the population (after burn in)
+    genVar <- varG(popgenox) # current genetic variance of the population (after burn in)
+    genicVar <- genicVarG(pop, simParam = SP)
+    PredAccgeno <- c(NA)#genomic estimated breeding value
+    
+    for(generation in 1:15) {
+      print(generation)
+      ans = fastRRBLUP(popgenox,use = "pheno", snpChip = arr, simParam = SP)
+      popgenox = setEBV(popgenox, ans, simParam = SP)
+      
+      PredAccgeno <- c(PredAccgeno,cor(gv(popgenox),#true genotypic values of the population 
+                                       ebv(popgenox)))#genomic estimated breeding value
+      
+      popgenox <- selectCross(pop = popgenox, nInd = n_parents, use = "ebv", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+      popgenox <- self(popgenox, simParam = SP)
+      popgenox <- makeDH(popgenox, nDH = n_ind, simParam = SP)
+      
+      genMean <- c(genMean, meanG(popgenox))
+      genVar <- c(genVar,varG(popgenox))
+      genicVar <- c(genicVar, genicVarG(popgenox, simParam = SP))
+      popgenox <- setPheno(popgenox, h2 = HSQ, simParam = SP)
+      
+    }
+    
+    RES_GENO[[arr]] <- data.frame(generation = 1:16, Geno = genMean[1:16],VarGeno = genVar[1:16], VarGenic = genicVar[1:16], PredAccgeno = PredAccgeno, Marker = SNPArr[arr], INC = "Normal")
+  }
+  
+  end <- Sys.time()
+  print(end-start)
+  
+  RES_GENO <- do.call(rbind,RES_GENO)
+  RES_GENO$rep <- rep
+  RES_GENO$nQTL <- nQTL
+  RES_GENO$HSQ <- HSQ
+  write.table(RES_GENO,file = paste0("Path/To/Storrage/Geno_nQTL",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+  
+  
+  # change recombination rate
+  
+  ## saving the positions of all the snps
+  SNPs1 <- names(as.data.frame(pullSnpGeno(popgeno, snpChip = 1, simParam = SP)))
+  SNPs2 <- names(as.data.frame(pullSnpGeno(popgeno, snpChip = 2, simParam = SP)))
+  SNPs3 <- names(as.data.frame(pullSnpGeno(popgeno, snpChip = 3, simParam = SP)))
+  SNPs4 <- names(as.data.frame(pullSnpGeno(popgeno, snpChip = 4, simParam = SP)))
+  
+  genMap <- SP$genMap # get the old genetic map
+  genMapnew <- lapply(genMap, function(x){x*inc}) # increase it by the factor
+  
+  temp <- lapply(1:10, function(x){pullSegSiteHaplo(popinc,chr = x, simParam = SP)})
+  
+  founderpop2 <- newMapPop(genMap = genMapnew, haplotypes = temp, inbred = F, ploidy = 2)
+  
+  traits <- SP$traits[[1]]
+  
+  
+  SP = SimParam$new(founderpop2)
+  
+  SP$nThreads <- 1
+  
+  SP$manAddTrait(traits)
+  SP$addSnpChipByName(SNPs1)
+  SP$addSnpChipByName(SNPs2)
+  SP$addSnpChipByName(SNPs3)
+  SP$addSnpChipByName(SNPs4)
+  
+  
+  SP$setVarE(h2 = HSQ) #defines the heritability for the trait
+  
+  pop = newPop(founderpop2, simParam = SP)
+  
+  pop <- setPheno(pop, h2 = HSQ, simParam = SP)
+  popPhen <- pop
+  popgeno <- pop
+  genMean <- meanG(pop)
+  genVar <- varG(pop)
+  genicVar <- genicVarG(pop, simParam = SP)
+  
+  start <- Sys.time()
+  
+  #repeat phenotypic selection with increased recombination rate
+  
+  for(generation in 1:15){
+    print(generation)
+    popPhen <- selectCross(pop = popPhen, nInd = n_parents, use = "pheno", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    popPhen <- self(popPhen, simParam = SP)
+    popPhen <- makeDH(popPhen, nDH = n_ind, simParam = SP)
+    
+    popPhen <- setPheno(popPhen, h2 = HSQ, simParam = SP)
+    genMean <- c(genMean, meanG(popPhen))
+    genVar <- c(genVar, varG(popPhen))
+    genicVar <- c(genicVar, genicVarG(popPhen, simParam = SP))
+  }
+  
+  end <- Sys.time()
+  print(end-start)
+  
+  
+  RES_PHENOINC <- data.frame(generation = 1:16, Geno = genMean[1:16], 
+                             VarGeno = genVar[1:16], VarGenic = genicVar[1:16], PredAccgeno = "NA", 
+                             Marker = "Pheno", INC = inc)
+  RES_PHENOINC$rep <- rep
+  RES_PHENOINC$nQTL <- nQTL
+  RES_PHENOINC$HSQ <- HSQ
+  
+  write.table(RES_PHENOINC,file = paste0("Path/To/Storrage/PhenoInc_nQTL",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+  
+  
+  #genomic prediction with increased recombination frequency
+  
+  RES_GENOINC <- list()
+  #measure the prediction accuracy of genomic selection along the program
+  start <- Sys.time()
+  
+  for (arr in 1:4) {
+    SNPArr[arr]
+    
+    popgenox <- popgeno
+    genMean <- meanG(popgenox) # current genetic mean of the population (after burn in)
+    genVar <- varG(popgenox) # current genetic variance of the population (after burn in)
+    genicVar <- genicVarG(pop, simParam = SP)                                  
+    PredAccgeno <- c(NA) # genomic estimated breeding value
+    
+    for(generation in 1:15) {
+      print(generation)
+      ans = fastRRBLUP(popgenox,use = "pheno", snpChip = arr, simParam = SP)
+      popgenox = setEBV(popgenox, ans, simParam = SP)
+      
+      PredAccgeno <- c(PredAccgeno, cor(gv(popgenox),#true genotypic values of the population 
+                                        ebv(popgenox)))#genomic estimated breeding value
+      
+      popgenox = selectCross(pop=popgenox, nInd = n_parents, use="ebv", nCrosses=n_crosses, nProgeny = 1, simParam = SP)
+      popgenox <- self(popgenox, simParam = SP)
+      popgenox <- makeDH(popgenox,nDH = n_ind, simParam = SP)
+      
+      genMean = c(genMean, meanG(popgenox))
+      genVar = c(genVar, varG(popgenox))
+      genicVar <- c(genicVar, genicVarG(popgenox, simParam = SP))
+      popgenox <- setPheno(popgenox, h2 = HSQ, simParam = SP)
+      
+    }
+    
+    RES_GENOINC[[arr]] <- data.frame(generation = 1:16, Geno = genMean[1:16], VarGeno = genVar[1:16], VarGenic = genicVar[1:16], PredAccgeno = PredAccgeno, Marker = SNPArr[arr], INC = inc)
+    
+  }
+  
+  end <- Sys.time()
+  print(end-start)
+  
+  RES_GENOINC <- do.call(rbind,RES_GENOINC)
+  RES_GENOINC$rep <- rep
+  RES_GENOINC$nQTL <- nQTL
+  RES_GENOINC$HSQ <- HSQ
+  write.table(RES_GENOINC,file = paste0("Path/To/Storrage/GenoInc_nQTL",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+  globalend <- Sys.time()
+  
+}
+
+
+# Stop the parallel backend
+stopCluster(cl)
