@@ -1,0 +1,320 @@
+################################################################################
+############# merging populations with different recombination rate ############
+################################################################################
+
+library(AlphaSimR)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+
+#setwd()
+setwd("Path/To/working_directory")
+
+# Clean the working environment and set default settings
+rm(list = ls())
+par(mfrow = c(1, 1), mar = c(1, 1, 1, 1))
+
+# Setup parallel backend to use many processors
+cl <- makeCluster(30, outfile = "cluster_output.txt")
+registerDoParallel(cl)
+
+args <- commandArgs(trailingOnly = TRUE)
+i <- as.integer(args[1])
+grid <- expand.grid(HSQ = c(0.2,0.5,0.8), nQTL = c(100,1000,10000), inc = c(2,4,8), rep = 1:10)
+grid$file <- paste0("GenoInc_nQTL",grid$nQTL,"_HSQ",grid$HSQ,"_Inc",grid$inc,"_Rep",grid$rep,".txt")
+grid <- grid[!grid$file %in% list.files(path = "Path/To/working_directory/"),]
+
+
+n_crosses <- 60
+n_parents <- 30
+n_ind <- 50
+
+# Perform the parallel computation
+results <- foreach(i = 1:nrow(grid), .packages = c("AlphaSimR", "foreach", "doParallel"), .combine = 'list') %dopar% {
+  print(paste0(round((i/325)*100,3),"%"))
+  
+  nQTL <- grid[i,]$nQTL
+  HSQ <- grid[i,]$HSQ
+  inc <- grid[i,]$inc
+  rep <- grid[i,]$rep
+  
+  #load map
+  map_data <- read.table("Path/To/working_directory/Map_SNPs.txt", header = T)
+  map_data <- map_data[order(map_data$CHROM, map_data$POS_cM), ]
+  genetic_maps <- split(map_data$POS_cM, map_data$CHROM)
+  physical_maps <- split(map_data$POS_bp, map_data$CHROM)
+  
+  SNPs_per_Chr <- sapply(genetic_maps, length)
+  length_M <- sapply(genetic_maps, max)/100
+  length_bp <- sapply(physical_maps, max)
+  
+  # Simulate founder genomes
+  founderGenomes <- runMacs2(
+    nInd = n_parents,       # number of founder individuals
+    nChr = 10,              # number of chromosomes
+    bp = length_bp,         # physical size of a chromosome
+    genLen = length_M,      # genetic size of a chromosome
+    mutRate = 3 * 10e-8,    # mutation rate
+    segSites = SNPs_per_Chr,# segregating sites per chromosomes, i.e. loci varying with their alleles within the population         
+    ploidy = 2,             # ploidy level, unless working with an autopolypoid leave at 2, allopolyploids mostly act as diploids
+    inbred = T,
+    Ne = 100                
+  )
+  
+  SP <- SimParam$new(founderGenomes)
+  
+  temp <- lapply(1:10, function(x){pullSegSiteHaplo(founderGenomes,chr = x, simParam = SP)})
+  
+  founderpop2 <- newMapPop(genMap = genetic_maps, haplotypes = temp, inbred = F, ploidy = 2)
+  
+  SP = SimParam$new(founderpop2)
+  
+  SP$nThreads <- 1
+  SP$addTraitA(nQtlPerChr = nQTL / 10) # number of QTL per chromosome
+  SP$setVarE(h2 = HSQ)                 # defines the heritability for the trait
+  
+  # add the different SNP-chips
+  SP$addSnpChip(nSnpPerChr = 100, name = "1k")
+  SP$addSnpChip(nSnpPerChr = 200, name = "2k")
+  SP$addSnpChip(nSnpPerChr = 500, name = "5k")
+  SP$addSnpChip(nSnpPerChr = 1000, name = "10k")
+  
+  
+  # Creation of base population of DHs
+  pop <- newPop(founderpop2, simParam = SP)        # Founding population of DH
+  pop <- randCross(pop, nCrosses = n_crosses, nProgeny = 1, simParam = SP) # crosses
+  pop <- self(pop, nProgeny = n_ind, simParam = SP)   # selfing
+  pop <- makeDH(pop, nDH = 1, simParam = SP)          # creation of DH from the selfings
+  pop <- setPheno(pop, h2 = HSQ, simParam = SP)       # Phenotype base population individuals
+  
+  
+  # Burn in process (10 generations of phenotypic selection)
+  burnin_pops <- list()
+  genMean_base <- c()
+  genVar_base <- c()
+  genicVar_base <- c()
+  
+  for (generation in 1:10) {
+    genMean_base <- c(genMean_base, meanG(pop))
+    genVar_base <- c(genVar_base, varG(pop))
+    genicVar_base <- c(genicVar_base, genicVarG(pop, simParam = SP))
+    pop <- selectCross(pop, nInd = n_parents, use = "pheno", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop <- self(pop, nProgeny = n_ind, simParam = SP)
+    pop <- makeDH(pop, nDH = 1, simParam = SP)
+    pop <- setPheno(pop, h2 = HSQ, simParam = SP)
+    if (generation > 7) #save the last generations in order to use them for the models
+      burnin_pops[[(generation-7)]] <- pop
+  }
+  
+  # Save the genetic mean and variance of each generation
+  RES_BURN <- data.frame(generation = 1:10, type = rep("normal", 2), Geno = genMean_base, VarGeno = genVar_base, VarGenic = genicVar_base, PredAccgeno = rep("NA",10), Marker = rep("NA",10))
+  RES_BURN$rep <- rep   
+  RES_BURN$nQTL <- nQTL
+  RES_BURN$HSQ <- HSQ
+  RES_BURN$INC <- inc
+  write.table(RES_BURN, file = paste0("Path/To/Storrage/BURN_nQTL", nQTL, "_HSQ", HSQ, "_Inc", inc, "_Rep", rep, ".txt"), quote = F, sep = "\t")
+  
+  
+  #last generation  
+  
+  #creating vectors and lists
+  SNPArr <- c("1k","2k","5k","10k")
+  
+  pop_inc <- pop
+  allcrosses <- list()
+  pop_base <- list()
+  RES_NORMAL <- list()
+  PredAccgeno_base <- c(NA,NA)
+  
+  for (arr in 1:4){
+    pop1 <- burnin_pops[[1]] # load last generations
+    pop2 <- burnin_pops[[2]]
+    pop3 <- burnin_pops[[3]]
+    merged_pop <- mergePops(list(pop1, pop2, pop3)) #merge the last generations
+    
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr) #create model
+    pop3 <- setEBV(pop3, ans, simParam = SP) # calculate breeding values
+    
+    PredAccgeno <- c(PredAccgeno_base, cor(gv(pop3), ebv(pop3))) # get prediction accuracy
+    
+    pop3 <- setPheno(pop3, h2 = HSQ, simParam = SP)
+    pop_base[[arr]] <- pop3
+    
+    crosses <- t(combn(1:n_parents,2))
+    crosses <- crosses[sample(1:nrow(crosses),60),]
+    allcrosses[[arr]] <- crosses 
+    
+    
+    #normal recombination
+    
+    #gen1
+    pop4 <- makeCross(pop3, nProgeny = 1, crossPlan = allcrosses[[arr]], simParam = SP) # combines randCross and selectInd
+    pop4 <- self(pop4, nProgeny = n_ind, simParam = SP) 
+    pop4 <- makeDH(pop4, nDH = 1, simParam = SP)     # create DH
+    pop4 <- setPheno(pop4, h2 = HSQ, simParam = SP)  # phenotype
+    
+    merged_pop <- mergePops(list(pop2, pop3, pop4))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop4 <- setEBV(pop4, ans, simParam = SP)
+    
+    PredAccgeno <- c(PredAccgeno, cor(gv(pop4), ebv(pop4))) 
+    genMean <- c(genMean_base, meanG(pop4)) 
+    genVar <- c(genVar_base, varG(pop4))
+    genicVar <- c(genicVar_base, genicVarG(pop4, simParam = SP))
+    
+    #gen2
+    pop5 <- selectCross(pop = pop4, nInd = n_parents, use = "ebv", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop5 <- self(pop5, nProgeny = n_ind, simParam = SP)
+    pop5 <- makeDH(pop5, nDH = 1, simParam = SP)
+    pop5 <- setPheno(pop5, h2 = HSQ, simParam = SP)
+    
+    merged_pop <- mergePops(list(pop3, pop4, pop5))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop5 <- setEBV(pop5, ans, simParam = SP)
+    
+    PredAccgeno <- c(PredAccgeno, cor(gv(pop5), ebv(pop5))) 
+    genMean <- c(genMean, meanG(pop5)) 
+    genVar <- c(genVar, varG(pop5))
+    genicVar <- c(genicVar, genicVarG(pop5, simParam = SP))
+    
+    #gen3
+    pop6 <- selectCross(pop = pop5, nInd = n_parents, use = "ebv", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop6 <- self(pop6, nProgeny = n_ind, simParam = SP)
+    pop6 <- makeDH(pop6, nDH = 1, simParam = SP)
+    pop6 <- setPheno(pop6, h2 = HSQ, simParam = SP)
+    
+    merged_pop <- mergePops(list(pop4, pop5, pop6))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop6 <- setEBV(pop6, ans, simParam = SP)
+    
+    PredAccgeno <- c(PredAccgeno, cor(gv(pop6), ebv(pop6))) 
+    genMean <- c(genMean, meanG(pop6)) 
+    genVar <- c(genVar, varG(pop6))
+    genicVar <- c(genicVar, genicVarG(pop6, simParam = SP))
+    
+    
+    RES_NORMAL[[arr]] <- data.frame(generation = 8:13, type = rep("normal", 6), Geno = genMean[8:13], VarGeno = genVar[8:13], VarGenic = genicVar[8:13], PredAccgeno = PredAccgeno[1:6], Marker = SNPArr[arr])
+  }
+  
+  
+  #increase recombination rate
+  
+  SNPs1 <- names(as.data.frame(pullSnpGeno(pop_inc, snpChip = 1, simParam = SP)))
+  SNPs2 <- names(as.data.frame(pullSnpGeno(pop_inc, snpChip = 2, simParam = SP)))
+  SNPs3 <- names(as.data.frame(pullSnpGeno(pop_inc, snpChip = 3, simParam = SP)))
+  SNPs4 <- names(as.data.frame(pullSnpGeno(pop_inc, snpChip = 4, simParam = SP)))
+  
+  genMap <- SP$genMap # get the old genetic map
+  genMapnew <- lapply(genMap, function(x){x*inc}) # increase it by the factor
+  
+  temp <- lapply(1:10, function(x){pullSegSiteHaplo(pop_inc,chr = x, simParam = SP)})
+  
+  founderpop2 <- newMapPop(genMap = genMapnew, haplotypes = temp, inbred = F, ploidy = 2)
+  
+  traits <- SP$traits[[1]]
+  
+  
+  SP = SimParam$new(founderpop2)
+  
+  SP$nThreads <- 1
+  
+  SP$manAddTrait(traits)
+  SP$addSnpChipByName(SNPs1)
+  SP$addSnpChipByName(SNPs2)
+  SP$addSnpChipByName(SNPs3)
+  SP$addSnpChipByName(SNPs4)
+  
+  SP$setVarE(h2 = HSQ) #defines the heritability for the trait
+  
+  pop_inc = newPop(founderpop2, simParam = SP)
+  
+  pop_inc <- setPheno(pop_inc, h2 = HSQ, simParam = SP)
+  
+  
+  #increase recombination
+  RES_INCREASED <- list()
+  SNPArr <- c("1k","2k","5k","10k")
+  
+  PredAccgeno <- c()
+  genMean <- c()
+  genMean <- c()
+  genicVar <- c()
+  
+  for (arr in 1:4){
+    SNPArr[arr]
+    pop2 <- burnin_pops[[2]]
+    pop3 <- burnin_pops[[3]]
+    pop4 <- pop_inc
+    
+    #gen1
+    pop4 <- makeCross(pop4, nProgeny = 1, crossPlan = allcrosses[[arr]], simParam = SP) # combines randCross and selectInd
+    pop4 <- self(pop4, nProgeny = n_ind, simParam = SP) 
+    pop4 <- makeDH(pop4, nDH = 1, simParam = SP)     # create DH
+    pop4 <- setPheno(pop4, h2 = HSQ, simParam = SP)  # phenotype
+    
+    merged_pop <- mergePops(list(pop2, pop3, pop4))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop4 <- setEBV(pop4, ans, simParam = SP)
+    
+    PredAccgeno <- cor(gv(pop4), ebv(pop4))
+    genMean <-  meanG(pop4)
+    genVar <-  varG(pop4)
+    genicVar <-  genicVarG(pop4, simParam = SP)
+    
+    #gen2
+    pop5 <- selectCross(pop = pop4, nInd = n_parents, use = "ebv", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop5 <- self(pop5, nProgeny = n_ind, simParam = SP)
+    pop5 <- makeDH(pop5, nDH = 1, simParam = SP)
+    pop5 <- setPheno(pop5, h2 = HSQ, simParam = SP)
+    
+    merged_pop <- mergePops(list(pop3, pop4, pop5))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop5 <- setEBV(pop5, ans, simParam = SP)
+    
+    PredAccgeno <- c(PredAccgeno, cor(gv(pop5), ebv(pop5))) 
+    genMean <- c(genMean, meanG(pop5)) 
+    genVar <- c(genVar, varG(pop5))
+    genicVar <- c(genicVar, genicVarG(pop5, simParam = SP))
+    
+    #gen3
+    pop6 <- selectCross(pop = pop5, nInd = n_parents, use = "ebv", nCrosses = n_crosses, nProgeny = 1, simParam = SP)
+    pop6 <- self(pop6, nProgeny = n_ind, simParam = SP)
+    pop6 <- makeDH(pop6, nDH = 1, simParam = SP)
+    pop6 <- setPheno(pop6, h2 = HSQ, simParam = SP)
+    
+    merged_pop <- mergePops(list(pop4, pop5, pop6))
+    ans <- fastRRBLUP(merged_pop, use = "pheno", simParam = SP, snpChip = arr)
+    pop6 <- setEBV(pop6, ans, simParam = SP)
+    
+    PredAccgeno <- c(PredAccgeno, cor(gv(pop6), ebv(pop6))) 
+    genMean <- c(genMean, meanG(pop6)) 
+    genVar <- c(genVar, varG(pop6))
+    genicVar <- c(genicVar, genicVarG(pop6, simParam = SP))
+    
+    
+    RES_INCREASED[[arr]] <- data.frame(generation = 11:13, type = rep("increased", 3), Geno = genMean[1:3], VarGeno = genVar[1:3], VarGenic = genicVar[1:3], PredAccgeno = PredAccgeno[1:3], Marker = SNPArr[arr])
+  }
+  
+  
+  
+  #save all data
+  
+  RES_NORMAL <- do.call(rbind,RES_NORMAL)
+  RES_NORMAL$rep <- rep
+  RES_NORMAL$nQTL <- nQTL
+  RES_NORMAL$HSQ <- HSQ
+  RES_NORMAL$INC <- inc
+  write.table(RES_NORMAL,file = paste0("Path/To/Storrage/NORMAL_nQTL_",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+  
+  RES_INCREASED <- do.call(rbind,RES_INCREASED)
+  RES_INCREASED$rep <- rep
+  RES_INCREASED$nQTL <- nQTL
+  RES_INCREASED$HSQ <- HSQ
+  RES_INCREASED$INC <- inc
+  write.table(RES_INCREASED,file = paste0("Path/To/Storrage/INCREASE_nQTL_",nQTL,"_HSQ",HSQ,"_Inc",inc,"_Rep",rep,".txt"),quote = F,sep = "\t")
+  
+}
+
+stopCluster(cl)
+
